@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "A UDP and HTTP based matchmaking server",
   "main": "server.ts",
+  "type": "module",
   "scripts": {
     "start": "node build/server.js",
     "start:dev": "nodemon --exec ts-node server.ts",
