@@ -2,12 +2,12 @@ import fs from "fs";
 import dgram from "dgram";
 import http from "http";
 import path from "path";
+import dotenv from "dotenv";
 
 console.log("The server has been started!");
 
 let last_timestamp = Date.now();
 
-import dotenv from "dotenv";
 dotenv.config();
 
 enum NetworkMessageType {
@@ -39,6 +39,7 @@ enum NetworkMessageType {
 interface ServerKeys {
   random_matchmaking: string;
   private_lobby: string;
+  admin: string;
 }
 
 interface HolepunchData {
@@ -57,93 +58,107 @@ interface StatsLog {
   invalid_typed_packets: number;
 }
 
-// Main server configuration object
 class ServerConfig {
-  match_id_counter: number = 0;
-  supported_game_versions: string[] = ["1.0.0"];
-  server_keys: ServerKeys = {
-    random_matchmaking: process.env.RANDOM_MATCHMAKING_KEY || "",
-    private_lobby: process.env.PRIVATE_LOBBY_KEY || "",
-  };
-  random_matchmaking_limit: number = 2;
-  holepunching_pairs_limit: number = 1000;
-  private_lobby_limit: number = 500;
-  random_matchmaking_inactive_timer: number = 7;
-  holepunching_pairs_inactive_timer: number = 7;
-  private_lobby_inactive_timer: number = 600;
-  logging_interval: number = 14400; //3600;
-  log_connected_ips: boolean = false;
-  udp_port: number = 63567;
-  latest_version: string = "1.0.0";
-  news: string = "There is no news or announcements!";
-
-  random_matchmaking_lists: Map<string, any[]> = new Map();
-  holepunching_pairs_map: Map<string, HolepunchData> = new Map();
-  private_lobby_maps: Map<string, Map<string, HolepunchData>> = new Map();
-  matches_log: any[] = [];
-  debug_log: string[] = [];
-  error_log: string[] = [];
-  stats_log: StatsLog = {
-    total_matches: 0,
-    total_holepunches_expired: 0,
-    total_lobbies_expired: 0,
-    sent_packets: 0,
-    received_packets: 0,
-    invalid_packets: 0,
-    invalid_typed_packets: 0,
-  };
-
-  constructor() {
-    // Ensure the environment variables are set
-    if (
-      !this.server_keys.random_matchmaking ||
-      !this.server_keys.private_lobby
-    ) {
-      console.error("Server keys are not set in the environment variables.");
-      process.exit(1);
+    match_id_counter: number = 0;
+    supported_game_versions: string[] = ["1.0.0"];
+    server_keys: ServerKeys = {
+      random_matchmaking: process.env.RANDOM_MATCHMAKING_KEY || "",
+      private_lobby: process.env.PRIVATE_LOBBY_KEY || "",
+      admin: process.env.ADMIN_KEY || ""
+    };
+    random_matchmaking_limit: number = 2;
+    holepunching_pairs_limit: number = 1000;
+    private_lobby_limit: number = 500;
+    random_matchmaking_inactive_timer: number = 7;
+    holepunching_pairs_inactive_timer: number = 7;
+    private_lobby_inactive_timer: number = 600;
+    logging_interval: number = 14400; //3600;
+    log_connected_ips: boolean = false;
+    udp_port: number = 63567;
+    latest_version: string = "1.0.0";
+    news: string = "There is no news or announcements!";
+  
+    constructor() {
+      // Ensure the environment variables are set
+      if (
+        !this.server_keys.random_matchmaking ||
+        !this.server_keys.private_lobby ||
+        !this.server_keys.admin
+      ) {
+        console.error("Server keys are not set in the environment variables.");
+        process.exit(1);
+      }
     }
   }
-}
-
-const server = new ServerConfig();
+  
+  class ServerState {
+    random_matchmaking_lists: Map<string, any[]> = new Map();
+    holepunching_pairs_map: Map<string, HolepunchData> = new Map();
+    private_lobby_maps: Map<string, Map<string, HolepunchData>> = new Map();
+    matches_log: any[] = [];
+    debug_log: string[] = [];
+    error_log: string[] = [];
+    stats_log: StatsLog = {
+      total_matches: 0,
+      total_holepunches_expired: 0,
+      total_lobbies_expired: 0,
+      sent_packets: 0,
+      received_packets: 0,
+      invalid_packets: 0,
+      invalid_typed_packets: 0,
+    };
+  }
+  
+  const serverConfig = new ServerConfig();
+  const serverState = new ServerState();
 
 //Load stats from file
 var old_stats = load_file("./logs/stats_log.json");
 if (old_stats != null) {
-  server.stats_log = old_stats;
+    serverState.stats_log = old_stats;
 }
 
 //Configurations - load from the file
 var config = load_file("config.json");
 if (config != null) {
   //Only override the values that are in the config object
-  const __server: any = server;
+  const __server: any = serverConfig;
   for (const [key, value] of Object.entries(config)) {
     __server[key] = value;
   }
 }
 
 //Create the random matchmaking / private lobby data structures for each version
-for (let i = 0; i < server.supported_game_versions.length; i++) {
-  let version = server.supported_game_versions[i];
+for (let i = 0; i < serverConfig.supported_game_versions.length; i++) {
+  let version = serverConfig.supported_game_versions[i];
   if (!version) {
     continue;
   }
   console.log("Creating data structures for version", version);
-  server.random_matchmaking_lists.set(version, []);
-  server.private_lobby_maps.set(version, new Map());
+  serverState.random_matchmaking_lists.set(version, []);
+  serverState.private_lobby_maps.set(version, new Map());
 }
 
 // Start a simple HTTP server to serve log files
 const httpServer = http.createServer((req, res) => {
+  serverState.debug_log.push(`HTTP request ${req.url}`); 
+  console.log(serverState.debug_log);
   if (!req.url) {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not found");
     return;
   }
+  // Check for Authorization header
+  const authHeader = req.headers.authorization;
+  if (!authHeader || authHeader !== `Bearer ${serverConfig.server_keys.admin}`) {
+    res.writeHead(401, { "Content-Type": "text/plain" });
+    res.end("Unauthorized");
+    return;
+  }
 
   // Basic routing to serve log files
-  const filePath = path.join(__dirname, "logs", path.basename(req.url));
+  const filePath = path.join(path.resolve(path.dirname('')), "logs", path.basename(req.url));
+  console.log(filePath);
 
   fs.readFile(filePath, (err, data) => {
     if (err) {
@@ -173,17 +188,17 @@ const HTTP_PORT = 8080; // You can choose any available port
 
 httpServer.listen(HTTP_PORT, () => {
   console.log(`HTTP server is running on http://localhost:${HTTP_PORT}/`);
-  server.debug_log.push(
+  serverState.debug_log.push(
     `HTTP server is running on http://localhost:${HTTP_PORT}/`
   );
 });
 
 //Starting the server
 const socket = dgram.createSocket("udp4");
-socket.bind(server.udp_port);
+socket.bind(serverConfig.udp_port);
 socket.on("listening", () => {
   const address = socket.address();
-  server.debug_log.push(
+  serverState.debug_log.push(
     `The socket is now listening to ${address.address}:${address.port}`
   );
 });
@@ -191,7 +206,7 @@ socket.on("listening", () => {
 //Receiving packets
 socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
   try {
-    server.stats_log.received_packets++;
+    serverState.stats_log.received_packets++;
     //Get the different parts of the message
     let msg: any = JSON.parse(msg_buffer.toString());
     let version = msg.version;
@@ -208,15 +223,15 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
       type === undefined ||
       data === undefined
     ) {
-      server.stats_log.invalid_packets++;
+        serverState.stats_log.invalid_packets++;
       throw "Invalid packet";
     }
 
     //IF the version is incorrect, send a message back to the player
-    if (!server.supported_game_versions.includes(version)) {
+    if (!serverConfig.supported_game_versions.includes(version)) {
       network_send(
         NetworkMessageType.IncorrectVersion,
-        `Your game's version (${version}) is not supported by the matchmaking server.`,
+        `Your game's version (${version}) is not supported by the matchmaking serverConfig.`,
         rinfo.address,
         rinfo.port
       );
@@ -224,8 +239,8 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
     }
 
     //Get the correct data structures for the version
-    let random_matchmaking_list = server.random_matchmaking_lists.get(version);
-    let private_lobby_map = server.private_lobby_maps.get(version);
+    let random_matchmaking_list = serverState.random_matchmaking_lists.get(version);
+    let private_lobby_map = serverState.private_lobby_maps.get(version);
 
     if (!random_matchmaking_list || !private_lobby_map) {
       return;
@@ -238,7 +253,7 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
     switch (type) {
       case NetworkMessageType.RandomMatchmakingBegin:
         //If the key is incorrect, ignore the packet completely
-        if (keys.random_matchmaking != server.server_keys.random_matchmaking) {
+        if (keys.random_matchmaking != serverConfig.server_keys.random_matchmaking) {
           return;
         }
         //Clean the matchmaking list
@@ -267,7 +282,7 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
         } else {
           //Add the player's match ID, ip, and port to the matchmaking list
           if (
-            random_matchmaking_list.length < server.random_matchmaking_limit
+            random_matchmaking_list.length < serverConfig.random_matchmaking_limit
           ) {
             random_matchmaking_list.push({
               timestamp: last_timestamp,
@@ -283,15 +298,15 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
             );
           } else {
             //Matchmaking list is somehow full. This should never happen
-            server.error_log.push(
+            serverState.error_log.push(
               `Matchmaking list is full: ${random_matchmaking_list.length}`
             );
           }
         }
         //Match pairs of players and send them a match_id
         while (random_matchmaking_list.length >= 2) {
-          let match_id = server.match_id_counter;
-          server.match_id_counter++;
+          let match_id = serverConfig.match_id_counter;
+          serverConfig.match_id_counter++;
           //Send a packet back to the first two players in the list
           network_send(
             NetworkMessageType.RandomMatchmakingFound,
@@ -306,21 +321,21 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
             random_matchmaking_list[1].port
           );
           //Logging
-          if (server.log_connected_ips) {
-            server.matches_log.push({
+          if (serverConfig.log_connected_ips) {
+            serverState.matches_log.push({
               match_id: match_id,
               ip1: random_matchmaking_list[0].ip,
               ip2: random_matchmaking_list[1].ip,
             });
           }
-          server.stats_log.total_matches++;
+          serverState.stats_log.total_matches++;
           //Remove players from the list
           random_matchmaking_list.splice(0, 2);
         }
         break;
       case NetworkMessageType.RandomMatchmakingCancel:
         //If the key is incorrect, ignore the packet completely
-        if (keys.random_matchmaking != server.server_keys.random_matchmaking) {
+        if (keys.random_matchmaking != serverConfig.server_keys.random_matchmaking) {
           return;
         }
         //Remove all elements in the list with the same ip and port (in case the player was accidentally added multiple times)
@@ -341,15 +356,15 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
         break;
       case NetworkMessageType.HolepunchingBegin:
         //If the key is incorrect, ignore the packet completely
-        if (keys.random_matchmaking != server.server_keys.random_matchmaking) {
+        if (keys.random_matchmaking != serverConfig.server_keys.random_matchmaking) {
           return;
         }
         //Clean the holepunching pairs map
         holepunching_pairs_map_clean();
         //Check if someone already has the match id in the map
-        if (server.holepunching_pairs_map.has(data)) {
+        if (serverState.holepunching_pairs_map.has(data)) {
           //Compare the ip and port to see if it is a different player or not
-          let holepunch_data = server.holepunching_pairs_map.get(data);
+          let holepunch_data = serverState.holepunching_pairs_map.get(data);
           if (!holepunch_data) {
             return;
           }
@@ -388,9 +403,9 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
         } else {
           //Add the player's match ID, ip, and port to the holepunching map
           if (
-            server.holepunching_pairs_map.size < server.holepunching_pairs_limit
+            serverState.holepunching_pairs_map.size < serverConfig.holepunching_pairs_limit
           ) {
-            server.holepunching_pairs_map.set(data, {
+            serverState.holepunching_pairs_map.set(data, {
               timestamp: last_timestamp,
               ip: ip,
               port: port,
@@ -404,19 +419,19 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
             );
           } else {
             //Too many playeres are already holepunching
-            server.error_log.push(
-              `Holepunching map is full: ${server.holepunching_pairs_map.size}`
+            serverState.error_log.push(
+              `Holepunching map is full: ${serverState.holepunching_pairs_map.size}`
             );
           }
         }
         break;
       case NetworkMessageType.HolepunchingCancel:
         //If the key is incorrect, ignore the packet completely
-        if (keys.random_matchmaking != server.server_keys.random_matchmaking) {
+        if (keys.random_matchmaking != serverConfig.server_keys.random_matchmaking) {
           return;
         }
         //Remove element with the given match_id from the map
-        server.holepunching_pairs_map.delete(data);
+        serverState.holepunching_pairs_map.delete(data);
         //Send back cancel confirmation
         network_send(
           NetworkMessageType.HolepunchingCancelConfirmation,
@@ -427,7 +442,7 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
         break;
       case NetworkMessageType.PrivateLobbyReserve:
         //If the key is incorrect, ignore the packet completely
-        if (keys.private_lobby != server.server_keys.private_lobby) {
+        if (keys.private_lobby != serverConfig.server_keys.private_lobby) {
           return;
         }
         //Clean the private lobby map
@@ -469,7 +484,7 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
             }
           }
           //Add the player's code, ip, and port to the private lobby map
-          if (private_lobby_map.size < server.private_lobby_limit) {
+          if (private_lobby_map.size < serverConfig.private_lobby_limit) {
             private_lobby_map.set(data, {
               timestamp: last_timestamp,
               ip: ip,
@@ -484,7 +499,7 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
             );
           } else {
             //Too many playeres are already reserving lobbies
-            server.error_log.push(
+            serverState.error_log.push(
               `Private lobby map is full: ${private_lobby_map.size}`
             );
           }
@@ -492,7 +507,7 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
         break;
       case NetworkMessageType.PrivateLobbyFind:
         //If the key is incorrect, ignore the packet completely
-        if (keys.private_lobby != server.server_keys.private_lobby) {
+        if (keys.private_lobby != serverConfig.server_keys.private_lobby) {
           return;
         }
         //Clean the private lobby map
@@ -540,7 +555,7 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
         break;
       case NetworkMessageType.PrivateLobbyFree:
         //If the key is incorrect, ignore the packet completely
-        if (keys.private_lobby != server.server_keys.private_lobby) {
+        if (keys.private_lobby != serverConfig.server_keys.private_lobby) {
           return;
         }
         //Free all lobbies reserved by the player.
@@ -561,60 +576,60 @@ socket.on("message", (msg_buffer: Buffer, rinfo: any) => {
         break;
       case NetworkMessageType.FetchNews:
         //Send back the news string, unless the game is on an older version
-        if (data != server.latest_version) {
+        if (data != serverConfig.latest_version) {
           network_send(
             NetworkMessageType.News,
             "A new version of Bear Bash is available! (" +
-              server.latest_version +
+              serverConfig.latest_version +
               ")",
             ip,
             port
           );
         } else {
-          network_send(NetworkMessageType.News, server.news, ip, port);
+          network_send(NetworkMessageType.News, serverConfig.news, ip, port);
         }
         break;
       default:
         //Invalid message type; don't do anything.
-        server.stats_log.invalid_typed_packets++;
+        serverState.stats_log.invalid_typed_packets++;
         break;
     }
   } catch (error) {
-    server.error_log.push(error);
+    serverState.error_log.push(error);
   }
 });
 
 //Save logging files
 setInterval(() => {
-  //console.log("Saving log files...");
+  console.log("Saving log files...");
   last_timestamp = Date.now();
 
-  if (server.matches_log.length > 0) {
+  if (serverState.matches_log.length > 0) {
     save_file(
-      server.matches_log,
+        serverState.matches_log,
       "./logs/matches_log (" + last_timestamp + ").json"
     );
   }
-  server.matches_log = [];
+  serverState.matches_log = [];
 
-  if (server.debug_log.length > 0) {
+  if (serverState.debug_log.length > 0) {
     save_file(
-      server.debug_log,
+        serverState.debug_log,
       "./logs/debug_log (" + last_timestamp + ").json"
     );
   }
-  server.debug_log = [];
+  serverState.debug_log = [];
 
-  if (server.error_log.length > 0) {
+  if (serverState.error_log.length > 0) {
     save_file(
-      server.error_log,
+      serverState.error_log,
       "./logs/error_log (" + last_timestamp + ").json"
     );
   }
-  server.error_log = [];
+  serverState.error_log = [];
 
-  save_file(server.stats_log, "./logs/stats_log.json");
-}, server.logging_interval * 1000);
+  save_file(serverState.stats_log, "./logs/stats_log.json");
+}, serverConfig.logging_interval * 1000);
 
 /*
 Removes all elements in the random matchmaking list for the given version that are too old
@@ -622,7 +637,7 @@ Removes all elements in the random matchmaking list for the given version that a
 function random_matchmaking_list_clean(version: string) {
   last_timestamp = Date.now();
   //let number_cleaned = 0;
-  let random_matchmaking_list = server.random_matchmaking_lists.get(version);
+  let random_matchmaking_list = serverState.random_matchmaking_lists.get(version);
   if (!random_matchmaking_list) {
     return;
   }
@@ -630,7 +645,7 @@ function random_matchmaking_list_clean(version: string) {
     let player = random_matchmaking_list[i];
     if (
       timestamp_difference(last_timestamp, player.timestamp) >
-      server.random_matchmaking_inactive_timer
+      serverConfig.random_matchmaking_inactive_timer
     ) {
       random_matchmaking_list.splice(i, 1);
       i--;
@@ -645,16 +660,16 @@ Removes all elements in the holepunching map for the given version that are too 
 function holepunching_pairs_map_clean() {
   last_timestamp = Date.now();
   let number_cleaned = 0;
-  for (let [key, val] of server.holepunching_pairs_map) {
+  for (let [key, val] of serverState.holepunching_pairs_map) {
     if (
       timestamp_difference(last_timestamp, val.timestamp) >
-      server.holepunching_pairs_inactive_timer
+      serverConfig.holepunching_pairs_inactive_timer
     ) {
-      server.holepunching_pairs_map.delete(key);
+        serverState.holepunching_pairs_map.delete(key);
       number_cleaned++;
     }
   }
-  server.stats_log.total_holepunches_expired += number_cleaned;
+  serverState.stats_log.total_holepunches_expired += number_cleaned;
 }
 /*
 Removes all elements in the private lobby map that are too old
@@ -662,20 +677,20 @@ Removes all elements in the private lobby map that are too old
 function private_lobby_map_clean(version: string) {
   last_timestamp = Date.now();
   let number_cleaned = 0;
-  let private_lobby_map = server.private_lobby_maps.get(version);
+  let private_lobby_map = serverState.private_lobby_maps.get(version);
   if (!private_lobby_map) {
     return;
   }
   for (let [key, val] of private_lobby_map) {
     if (
       timestamp_difference(last_timestamp, val.timestamp) >
-      server.private_lobby_inactive_timer
+      serverConfig.private_lobby_inactive_timer
     ) {
       private_lobby_map.delete(key);
       number_cleaned++;
     }
   }
-  server.stats_log.total_lobbies_expired += number_cleaned;
+  serverState.stats_log.total_lobbies_expired += number_cleaned;
 }
 
 /*
@@ -689,10 +704,10 @@ function network_send(
 ) {
   try {
     socket.send(JSON.stringify({ type: type, data: data }), port, ip);
-    server.stats_log.sent_packets++;
+    serverState.stats_log.sent_packets++;
     return true;
   } catch (error) {
-    server.error_log.push(error);
+    serverState.error_log.push(error);
     return false;
   }
 }
@@ -714,7 +729,8 @@ function save_file(data: any, filename: string) {
     fs.writeFileSync(filename, JSON.stringify(data));
     return true;
   } catch (error) {
-    server.error_log.push(error);
+    console.log(error);
+    serverState.error_log.push(error);
     return false;
   }
 }
@@ -726,7 +742,7 @@ function load_file(filename: string) {
   try {
     return JSON.parse(fs.readFileSync(filename).toString());
   } catch (error) {
-    server.error_log.push(error);
+    serverState.error_log.push(error);
     return null;
   }
 }

@@ -3,3 +3,10 @@ node_modules/
 
 # Build output directory
 build/
+
+logs/
+
+
+.env
+
+.DS_Store
